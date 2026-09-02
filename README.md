@@ -25,23 +25,13 @@
 
 ## 项目预览
 
-**登录与注册**
+![预览1](img/0e0673b2f434ec936ae8da84789639ce.png)
 
-![DoVideoAI 登录与注册](docs/images/login-register.png)
+![预览2](img/286af3fc5864a589ecfa7688e6e03d16.png)
 
-**视频工作台**
+![预览3](img/ScreenShot_2026-09-01_121000_587.png)
 
-![DoVideoAI 视频工作台](docs/images/video-library.png)
-
-**Agent 目标输入**
-
-![DoVideoAI Agent 目标输入](docs/images/agent-compose.png)
-
-**Agent 分析结果**
-
-<img width="2886" height="1656" alt="b89cf519f7189cf823507d5c17b0d88d" src="https://github.com/user-attachments/assets/8bfeed0e-28df-4527-86bf-e549f5516dcc" />
-
-<img width="1776" height="1708" alt="a52abccc6447591c6f9a66ad948c5709" src="https://github.com/user-attachments/assets/9e04ecca-a2a5-4d59-89d7-8f4329858070" />
+![预览4](img/ScreenShot_2026-09-02_234359_996.png)
 
 
 
