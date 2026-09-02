@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { apiRequest } from './api'
-import { DEMO_EVALUATION, DEMO_ITEM, DEMO_PLAN, DEMO_RESULT, DEMO_TRACE } from './demoData'
+import { DEMO_DEEP_RESULT, DEMO_EVALUATION, DEMO_ITEM, DEMO_PLAN, DEMO_RESULT, DEMO_TRACE } from './demoData'
 import { renderMarkdown } from './markdown'
 
 const DEFAULT_GOAL = '理解视频核心内容，提炼关键结论，并给出带时间戳的证据和可执行建议'
@@ -13,7 +13,8 @@ const ANALYSIS_MODES = [
   { value: 'GENERAL', title: '通用', description: '结论 · 时间戳证据 · 建议' },
   { value: 'LEARNING', title: '学习', description: '知识点大纲 · 重点难点 · 自测题' },
   { value: 'REVIEW', title: '审查', description: '逻辑漏洞 · 夸大表述 · 遗漏点' },
-  { value: 'CREATION', title: '创作', description: '爆点片段 · 标题 · 口播脚本' }
+  { value: 'CREATION', title: '创作', description: '爆点片段 · 标题 · 口播脚本' },
+  { value: 'DEEP', title: '深度', description: '核心洞察 · 推理过程 · 批判分析 · 可操作收获' }
 ]
 const GOAL_PRESETS = [
   {
@@ -30,6 +31,11 @@ const GOAL_PRESETS = [
     title: '操作手册',
     description: '步骤、条件与异常处理',
     prompt: '生成可执行操作手册，提取前置条件、操作步骤、注意事项和异常处理，并引用对应时间戳'
+  },
+  {
+    title: '深度分析',
+    description: '核心洞察、推理过程与批判性思考',
+    prompt: '进行深度分析：识别核心论点和隐含假设，分析论证逻辑和证据强度，评估优缺点和局限性，关联到更广泛的知识背景，提炼可操作的洞察和应用建议'
   }
 ]
 const STAGE_LABELS = {
@@ -71,7 +77,14 @@ function createSidebarState() {
     feedbackLoading: false,
     editingPlan: false,
     planDraft: [],
-    rerunLoading: false
+    rerunLoading: false,
+    // 深度分析结构化数据与视图控制
+    deepResult: null,
+    deepResultLoading: false,
+    viewMode: 'sidebar',         // 'sidebar' | 'workspace'
+    workspaceView: 'balanced',   // 'analysis' | 'video' | 'balanced' | 'timeline'
+    activeInsightIndex: null,
+    videoCurrentTime: 0
   }
 }
 
@@ -175,7 +188,13 @@ export function useAnalysisWorkspace({
         sidebar.value.streamRetry = 0
         sidebar.value.error = failed ? result : ''
         if (failed && type === 'ai') sidebar.value.mode = 'compose'
-        if (type === 'ai' && !failed) await refreshAgentMeta(id, goal, true, resolvedMode)
+        if (type === 'ai' && !failed) {
+          await refreshAgentMeta(id, goal, true, resolvedMode)
+          // 分析完成后切换到分屏工作台视图
+          sidebar.value.viewMode = 'workspace'
+          // DEEP 模式额外获取结构化数据
+          if (resolvedMode === 'DEEP') await fetchDeepResult(id, goal)
+        }
       }
       // 用户可能已经关掉面板去看别的视频，带上文件名才知道是哪个任务结束了。
       const filename = watching ? '' : findMediaItem(id)?.filename || ''
@@ -364,7 +383,10 @@ export function useAnalysisWorkspace({
         sidebar.value.mode = 'result'
         sidebar.value.content = status.result || ''
         sidebar.value.loading = false
+        sidebar.value.viewMode = 'workspace'
         await refreshAgentMeta(item.id, goal, true, analysisMode)
+        // 恢复已有的 DEEP 模式结构化数据
+        if (analysisMode === 'DEEP') await fetchDeepResult(item.id, goal)
       } else if (status.state === 'QUEUED' || status.state === 'PROCESSING') {
         sidebar.value.mode = 'result'
         sidebar.value.loading = true
@@ -391,6 +413,42 @@ export function useAnalysisWorkspace({
     if (!sidebar.value.plan) sidebar.value.plan = DEMO_PLAN
     sidebar.value.trace = DEMO_TRACE
     sidebar.value.evaluation = DEMO_EVALUATION
+    // DEEP 模式额外加载结构化数据并切换到工作台视图
+    if (sidebar.value.analysisMode === 'DEEP') {
+      sidebar.value.deepResult = DEMO_DEEP_RESULT
+      sidebar.value.viewMode = 'workspace'
+    }
+  }
+
+  // 获取深度分析的结构化 JSON 结果。成功后自动切换到工作台视图。
+  const fetchDeepResult = async (mediaId, goal) => {
+    if (sidebar.value.deepResultLoading) return
+    sidebar.value.deepResultLoading = true
+    try {
+      const params = new URLSearchParams({ id: String(mediaId) })
+      const response = await apiRequest(`/analysis/deep-result?${params}`)
+      if (!response.ok) throw new Error(await response.text())
+      const result = await response.json()
+      if (!isCurrentWorkspace(mediaId, 'ai', goal, 'DEEP')) return
+      if (result) {
+        sidebar.value.deepResult = result
+        sidebar.value.viewMode = 'workspace'
+      }
+    } catch (error) {
+      console.warn('Deep analysis result unavailable', error)
+    } finally {
+      if (isCurrentWorkspace(mediaId, 'ai', goal, 'DEEP')) {
+        sidebar.value.deepResultLoading = false
+      }
+    }
+  }
+
+  const setActiveInsight = index => {
+    sidebar.value.activeInsightIndex = index
+  }
+
+  const setWorkspaceView = view => {
+    sidebar.value.workspaceView = view
   }
 
   // AUTO 模式的意图路由:仅凭目标文本让后端 AI 判定出具体模式。apiRequest 已解包信封,
@@ -697,6 +755,9 @@ export function useAnalysisWorkspace({
     handlePlaybackError,
     resetWorkspace,
     discardMediaWorkspace,
+    fetchDeepResult,
+    setActiveInsight,
+    setWorkspaceView,
     formatPercent: value => `${Math.round((Number(value) || 0) * 100)}%`
   }
 }
@@ -726,7 +787,7 @@ function formatDuration(value) {
 }
 
 function goalDraftKey(mediaId) {
-  return `dovideo:goal:${mediaId}`
+  return `videomind:goal:${mediaId}`
 }
 
 function loadGoalDraft(mediaId) {
@@ -747,7 +808,7 @@ function saveGoalDraft(mediaId, goal) {
 }
 
 function modeDraftKey(mediaId) {
-  return `dovideo:mode:${mediaId}`
+  return `videomind:mode:${mediaId}`
 }
 
 function loadModeDraft(mediaId) {

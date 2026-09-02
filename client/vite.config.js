@@ -8,6 +8,7 @@ export default defineConfig(({ mode }) => {
     envDir: '..',
     plugins: [vue()],
     server: {
+      port: 5713,
       proxy: Object.fromEntries(
         ['/user', '/media', '/analysis', '/admin', '/health'].map(path => [
           path,
