@@ -5,6 +5,7 @@ import com.example.server.common.Result;
 import com.example.server.dto.AgentFeedback;
 import com.example.server.dto.AgentState;
 import com.example.server.dto.AnalysisMode;
+import com.example.server.dto.DeepAnalysisResult;
 import com.example.server.dto.RouteDecision;
 import com.example.server.dto.RouteRequest;
 import com.example.server.dto.TaskStatus;
@@ -22,7 +23,10 @@ import com.example.server.service.MediaService;
 import com.example.server.service.TaskEventService;
 import com.example.server.service.VideoContextNotReadyException;
 import com.example.server.service.mode.ModeRouter;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -46,6 +50,7 @@ import java.util.function.Supplier;
 @RequestMapping("/analysis")
 public class AnalysisController {
 
+    private static final Logger log = LoggerFactory.getLogger(AnalysisController.class);
     private static final int MAX_GOAL_LENGTH = 500;
 
     private final AiService aiService;
@@ -58,6 +63,7 @@ public class AnalysisController {
     private final AnalysisStatusService statusService;
     private final ModeRouter modeRouter;
     private final Executor aiTaskExecutor;
+    private final ObjectMapper objectMapper;
 
     public AnalysisController(AiService aiService,
                               AnalysisDispatchService dispatchService,
@@ -68,7 +74,8 @@ public class AnalysisController {
                               TaskEventService taskEventService,
                               AnalysisStatusService statusService,
                               ModeRouter modeRouter,
-                              @Qualifier("aiTaskExecutor") Executor aiTaskExecutor) {
+                              @Qualifier("aiTaskExecutor") Executor aiTaskExecutor,
+                              ObjectMapper objectMapper) {
         this.aiService = aiService;
         this.dispatchService = dispatchService;
         this.checkpointService = checkpointService;
@@ -79,6 +86,7 @@ public class AnalysisController {
         this.statusService = statusService;
         this.modeRouter = modeRouter;
         this.aiTaskExecutor = aiTaskExecutor;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -234,6 +242,28 @@ public class AnalysisController {
         mediaService.requireOwnedMedia(id, userId);
         return Result.ok(telemetry.latest(
                 id, normalizeText(goal, "分析目标"), AnalysisMode.fromRequest(mode)));
+    }
+
+    /**
+     * 获取深度分析的结构化结果。如果该视频使用 DEEP 模式分析过，返回完整的 DeepAnalysisResult；
+     * 否则返回 null，前端可降级到 Markdown 展示。
+     */
+    @GetMapping("/deep-result")
+    public Result<DeepAnalysisResult> deepAnalysisResult(
+            @RequestParam Long id,
+            @RequestAttribute(AuthService.REQUEST_USER_ID) Long userId) {
+        MediaFile mediaFile = mediaService.requireOwnedMedia(id, userId);
+        if (mediaFile.getDeepAnalysisJson() == null) {
+            return Result.ok(null);
+        }
+        try {
+            DeepAnalysisResult result = objectMapper.readValue(
+                    mediaFile.getDeepAnalysisJson(), DeepAnalysisResult.class);
+            return Result.ok(result);
+        } catch (Exception e) {
+            log.warn("Failed to deserialize deep analysis result for mediaId={}", id, e);
+            return Result.ok(null);
+        }
     }
 
     /**

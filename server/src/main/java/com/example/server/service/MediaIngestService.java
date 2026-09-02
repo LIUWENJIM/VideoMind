@@ -9,6 +9,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 
 @Service
 public class MediaIngestService {
@@ -33,22 +36,70 @@ public class MediaIngestService {
         String filename = mediaService.normalizeVideoFilename(file.getOriginalFilename());
         String md5 = mediaService.calculateMd5(file);
         String fileUrl = minioUtils.uploadFile(file);
-        return mediaService.saveUploadedMedia(filename, fileUrl, userId, md5);
+
+        // 提取封面：保存到临时文件后用 FFmpeg 取帧
+        String coverUrl = null;
+        Path tempVideo = null;
+        File coverFile = null;
+        try {
+            tempVideo = Files.createTempFile("ingest-", "-" + filename);
+            file.transferTo(tempVideo.toFile());
+            coverFile = ytDlpUtils.extractCoverFromVideo(tempVideo.toFile());
+            if (coverFile != null) {
+                coverUrl = minioUtils.uploadLocalFile(coverFile, "cover.jpg", "covers/");
+            }
+        } catch (Exception e) {
+            log.warn("cover_extraction_failed_for_upload", e);
+        } finally {
+            Files.deleteIfExists(tempVideo);
+            if (coverFile != null) Files.deleteIfExists(coverFile.toPath());
+        }
+
+        MediaFile media = mediaService.saveUploadedMedia(filename, fileUrl, userId, md5);
+        if (coverUrl != null) {
+            mediaService.updateCoverUrl(media.getId(), coverUrl);
+        }
+        return media;
     }
 
     public MediaFile ingestUrl(String url, Long userId) throws Exception {
         if (url == null || url.isBlank()) throw new IllegalArgumentException("视频链接不能为空");
 
+        // 先提取视频标题，用作显示名称
+        String title = ytDlpUtils.extractTitle(url);
+
         File tempFile = null;
+        File coverFile = null;
         try {
             tempFile = ytDlpUtils.downloadVideo(url);
             String md5 = mediaService.calculateMd5(tempFile);
             String fileUrl = minioUtils.uploadLocalFile(tempFile);
-            return mediaService.saveUploadedMedia("WEB_" + tempFile.getName(), fileUrl, userId, md5);
+            // 优先用视频标题，降级到 "WEB_" + 临时文件名
+            String displayName = (title != null && !title.isBlank())
+                    ? title + ".mp4"
+                    : "WEB_" + tempFile.getName();
+
+            // 提取封面：优先用 yt-dlp 下载的缩略图，降级用 FFmpeg 取帧
+            String coverUrl = null;
+            coverFile = ytDlpUtils.findDownloadedThumbnail(tempFile);
+            if (coverFile == null) {
+                coverFile = ytDlpUtils.extractCoverFromVideo(tempFile);
+            }
+            if (coverFile != null) {
+                coverUrl = minioUtils.uploadLocalFile(coverFile, "cover.jpg", "covers/");
+            }
+
+            MediaFile media = mediaService.saveUploadedMedia(displayName, fileUrl, userId, md5);
+            if (coverUrl != null) {
+                mediaService.updateCoverUrl(media.getId(), coverUrl);
+            }
+            return media;
         } finally {
-            // 这份文件只是搬运工，进了 MinIO 就别继续占着本地磁盘了。
             if (tempFile != null && tempFile.exists() && !tempFile.delete()) {
                 log.warn("temporary_video_cleanup_failed path={}", tempFile.getAbsolutePath());
+            }
+            if (coverFile != null && coverFile.exists() && !coverFile.delete()) {
+                log.warn("temporary_cover_cleanup_failed path={}", coverFile.getAbsolutePath());
             }
         }
     }

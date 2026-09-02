@@ -2,6 +2,7 @@ package com.example.server.utils;
 
 import com.example.server.dto.AgentState;
 import com.example.server.dto.AnalysisResult;
+import com.example.server.dto.DeepAnalysisResult;
 import com.example.server.dto.ModeClassification;
 import com.example.server.dto.VideoChunk;
 import com.example.server.dto.VideoContext;
@@ -16,6 +17,14 @@ import dev.langchain4j.exception.NonRetriableException;
 import dev.langchain4j.exception.RetriableException;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.retry.MaxRetriesExceededException;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
@@ -32,7 +41,7 @@ import java.util.concurrent.TimeoutException;
 @Component
 public class DeepSeekUtils {
 
-    private static final int MAX_MODEL_ATTEMPTS = 3;
+    private static final Logger log = LoggerFactory.getLogger(DeepSeekUtils.class);
     private static final int MAX_CAUSE_DEPTH = 8;
     private static final String SYSTEM_POLICY = """
             你是 DoVideoAI 的受控 Video Agent 模型组件，只执行当前请求开头明确指定的
@@ -51,6 +60,11 @@ public class DeepSeekUtils {
     private final long modelTimeoutMs;
     private final double inputPricePerMillion;
     private final double outputPricePerMillion;
+
+    /** 熔断器：滑动窗口 10 次请求，失败率 ≥50% 时打开，60s 后半开探测。 */
+    private final CircuitBreaker circuitBreaker;
+    /** 重试器：最多 3 次尝试，指数退避 500ms→10s。 */
+    private final Retry retry;
 
     public DeepSeekUtils(@Value("${ai.deepseek.api-key}") String apiKey,
                          @Value("${ai.deepseek.base-url}") String baseUrl,
@@ -86,6 +100,39 @@ public class DeepSeekUtils {
         this.modelTimeoutMs = TimeUnit.SECONDS.toMillis(timeoutSeconds);
         this.inputPricePerMillion = inputPricePerMillion;
         this.outputPricePerMillion = outputPricePerMillion;
+
+        // Circuit breaker: sliding window of 10 calls, opens at ≥50% failure rate,
+        // waits 60s in open state, then allows 3 half-open probes before deciding.
+        CircuitBreakerConfig cbConfig = CircuitBreakerConfig.custom()
+                .slidingWindowSize(10)
+                .failureRateThreshold(50)
+                .waitDurationInOpenState(java.time.Duration.ofSeconds(60))
+                .permittedNumberOfCallsInHalfOpenState(3)
+                .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+                .build();
+        this.circuitBreaker = CircuitBreaker.of("llm-deepseek", cbConfig);
+        this.circuitBreaker.getEventPublisher()
+                .onStateTransition(event -> log.warn("llm_circuit_breaker_transition from={} to={}",
+                        event.getStateTransition().getFromState(),
+                        event.getStateTransition().getToState()));
+
+        // Retry: exponential backoff 500ms → 10s, max 3 attempts, retry on retriable errors.
+        RetryConfig retryConfig = RetryConfig.<String>custom()
+                .maxAttempts(3)
+                .waitDuration(java.time.Duration.ofMillis(500))
+                .intervalBiFunction((attempt, resultOrException) -> {
+                    if (resultOrException.isLeft()) {
+                        return Math.min(500L * (1L << (attempt - 1)), 10_000L);
+                    }
+                    return 0L;
+                })
+                .retryOnException(e -> isRetriableModelFailure(e))
+                .build();
+        this.retry = Retry.of("llm-deepseek", retryConfig);
+        this.retry.getEventPublisher()
+                .onRetry(event -> log.info("llm_retry_attempt lastException={}",
+                        event.getLastThrowable() != null
+                                ? event.getLastThrowable().getMessage() : "null"));
     }
 
     /** 兼容旧调用方:无模式指令 = 通用规划,prompt 与引入模式前逐字节一致。 */
@@ -290,6 +337,101 @@ public class DeepSeekUtils {
         }
     }
 
+    /**
+     * 深度分析执行器：引导 LLM 进行深度思考，产出有洞察的分析，而非简单摘要。
+     * 关键改进：
+     * 1. 要求先思考再输出（thinking chain）
+     * 2. 输出结构化洞察（不只是结论）
+     * 3. 包含批判性分析（局限性、替代观点）
+     * 4. 提供可操作收获（如何应用）
+     */
+    public DeepAnalysisResult executeDeepAnalysis(VideoContext context,
+                                                   AgentState.AgentPlan plan,
+                                                   AgentState.CriticResult previousCritique,
+                                                   String modeInstruction) {
+        try {
+            String prompt = """
+                    你是 Video Agent 的深度分析执行器。你的任务不是简单总结视频内容，而是进行深度分析和洞察提炼。
+
+                    ## 分析要求
+
+                    1. **核心洞察**：不要只说"视频说了什么"，要回答"这意味着什么"
+                       - 识别视频的核心论点和隐含假设
+                       - 解释为什么这些观点重要
+                       - 关联到更广泛的知识背景
+
+                    2. **推理过程**：每个洞察都要有推理支撑
+                       - 为什么这是重要的？（reasoning）
+                       - 这与其他概念有什么关系？（relatedConcepts）
+                       - 这意味着什么？（implications）
+
+                    3. **批判性思考**：不只是接受视频观点
+                       - 论证的优点是什么？（strengths）
+                       - 有哪些局限性或假设？（limitations）
+                       - 有什么替代观点？（alternativePerspectives）
+
+                    4. **可操作性**：不只是理论分析
+                       - 如何应用这些洞察？（application）
+                       - 下一步做什么？（nextSteps）
+
+                    ## 输出格式
+
+                    只返回 JSON（严格遵守）：
+                    {
+                      "executiveSummary": "一句话总结核心洞察（不超过100字）",
+                      "context": "背景与重要性（为什么这个视频值得看，2-3句话）",
+                      "keyInsights": [
+                        {
+                          "insight": "核心洞察（不只是事实，要有深度）",
+                          "reasoning": "为什么这是重要的（推理过程）",
+                          "evidence": [
+                            {"timestampMs": 120000, "source": "ASR", "content": "原始证据", "claim": "支持的洞察"}
+                          ],
+                          "implications": "这意味着什么（影响/启示）",
+                          "relatedConcepts": ["相关概念1", "相关概念2"]
+                        }
+                      ],
+                      "criticalAnalysis": {
+                        "strengths": ["论证优点1", "论证优点2"],
+                        "limitations": ["局限性1", "假设1"],
+                        "alternativePerspectives": ["替代观点1", "替代观点2"]
+                      },
+                      "actionableTakeaways": [
+                        {
+                          "takeaway": "可操作的收获",
+                          "application": "如何应用",
+                          "nextSteps": ["步骤1", "步骤2"],
+                          "evidence": [
+                            {"timestampMs": 180000, "source": "ASR", "content": "原始证据", "claim": "支持的收获"}
+                          ]
+                        }
+                      ]
+                    }
+
+                    ## 重要约束
+
+                    - 所有 evidence 必须来自 VideoContext，不得虚构
+                    - evidence.timestampMs 必须落在原始片段内
+                    - evidence.source 只能是 ASR、OCR 或 ASR+OCR
+                    - 每个 insight 至少绑定 1 条 evidence
+                    - 每个 takeaway 至少绑定 1 条 evidence
+                    - 如果存在 Critic 反馈，只修正被指出的问题
+
+                    Plan:
+                    """ + objectMapper.writeValueAsString(plan) + """
+
+                    PreviousCritique:
+                    """ + objectMapper.writeValueAsString(previousCritique) + """
+
+                    VideoContext:
+                    """ + objectMapper.writeValueAsString(context)
+                    + executeSuffix(modeInstruction);
+            return structuredChat("DEEP_EXECUTOR", prompt, DeepAnalysisResult.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("深度分析执行失败", e);
+        }
+    }
+
     /** 兼容旧调用方:无模式指令 = 通用校验,prompt 与引入模式前逐字节一致。 */
     public AgentState.CriticResult critique(VideoContext context,
                                             AgentState.AgentPlan plan,
@@ -388,32 +530,41 @@ public class DeepSeekUtils {
     }
 
     private String chat(String stage, String prompt) {
-        RuntimeException lastError = null;
-        for (int attempt = 0; attempt < MAX_MODEL_ATTEMPTS; attempt++) {
-            long started = System.nanoTime();
-            try {
-                String response = invokeModel(prompt);
-                if (response == null || response.isBlank()) {
-                    throw new RetriableException("模型返回空响应");
+        long started = System.nanoTime();
+        try {
+            // Circuit breaker wraps retry: opens after sustained failures, rejects calls when open.
+            // Retry wraps invokeModel: up to 3 attempts with exponential backoff for retriable errors.
+            String response = circuitBreaker.executeSupplier(() -> {
+                try {
+                    return retry.executeCallable(() -> {
+                        String r = invokeModel(prompt);
+                        if (r == null || r.isBlank()) {
+                            throw new RetriableException("模型返回空响应");
+                        }
+                        return r;
+                    });
+                } catch (MaxRetriesExceededException e) {
+                    throw new IllegalStateException("模型调用达到最大重试次数", e);
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new IllegalStateException("模型调用失败", e);
                 }
-                telemetry.modelCall(stage, SYSTEM_POLICY + "\n" + prompt, response,
-                        inputPricePerMillion, outputPricePerMillion, started);
-                return response;
-            } catch (RuntimeException e) {
-                lastError = e;
-                telemetry.incrementCurrent("modelCallFailures", 1);
-                boolean retriable = isRetriableModelFailure(e);
-                if (!retriable || attempt == MAX_MODEL_ATTEMPTS - 1) {
-                    telemetry.failCurrentStage(stage, started);
-                    if (!retriable) {
-                        throw new IllegalArgumentException("模型请求不可重试", e);
-                    }
-                    break;
-                }
-                waitBeforeRetry(attempt);
+            });
+            telemetry.modelCall(stage, SYSTEM_POLICY + "\n" + prompt, response,
+                    inputPricePerMillion, outputPricePerMillion, started);
+            return response;
+        } catch (CallNotPermittedException e) {
+            telemetry.failCurrentStage(stage, started);
+            throw new IllegalStateException("LLM 服务熔断中，请稍后重试", e);
+        } catch (RuntimeException e) {
+            telemetry.incrementCurrent("modelCallFailures", 1);
+            telemetry.failCurrentStage(stage, started);
+            if (!isRetriableModelFailure(e)) {
+                throw new IllegalArgumentException("模型请求不可重试", e);
             }
+            throw e;
         }
-        throw new IllegalStateException("模型调用达到最大重试次数", lastError);
     }
 
     private String invokeModel(String prompt) {
@@ -461,14 +612,4 @@ public class DeepSeekUtils {
         }
         return false;
     }
-
-    private void waitBeforeRetry(int attempt) {
-        try {
-            Thread.sleep(1_000L << attempt);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("模型重试被中断", e);
-        }
-    }
-
 }

@@ -29,10 +29,15 @@ public class AgentLoopService {
     private final AgentTelemetry telemetry;
     private final EvidenceVerificationService evidenceVerificationService;
     private final TaskEventService taskEventService;
+
+    /** Config ceiling: dynamic budget never exceeds these values. */
     private final int maxRounds;
     private final long maxDurationMs;
     private final long maxEstimatedTokens;
     private final double maxEstimatedCost;
+
+    /** Per-run budget computed from video complexity. */
+    record BudgetConfig(int maxRounds, long durationMs, long maxTokens) {}
 
     public AgentLoopService(DeepSeekUtils deepSeekUtils,
                             LongVideoContextService longVideoContextService,
@@ -50,8 +55,19 @@ public class AgentLoopService {
         this.telemetry = telemetry;
         this.evidenceVerificationService = evidenceVerificationService;
         this.taskEventService = taskEventService;
-        if (maxRounds < 1 || maxDurationMs < 1 || maxEstimatedTokens < 1 || maxEstimatedCost < 0) {
-            throw new IllegalArgumentException("Agent 终止预算配置无效");
+        if (maxRounds < 1 || maxRounds > 5) {
+            throw new IllegalArgumentException("max-rounds 必须在 1-5 之间，当前值: " + maxRounds);
+        }
+        if (maxDurationMs < 10_000L || maxDurationMs > 600_000L) {
+            throw new IllegalArgumentException(
+                    "max-duration-ms 必须在 10s-600s 之间，当前值: " + maxDurationMs);
+        }
+        if (maxEstimatedTokens < 10_000L || maxEstimatedTokens > 200_000L) {
+            throw new IllegalArgumentException(
+                    "max-estimated-tokens 必须在 10000-200000 之间，当前值: " + maxEstimatedTokens);
+        }
+        if (maxEstimatedCost < 0) {
+            throw new IllegalArgumentException("max-estimated-cost 不能为负数");
         }
         this.maxRounds = maxRounds;
         this.maxDurationMs = maxDurationMs;
@@ -74,8 +90,11 @@ public class AgentLoopService {
      */
     public AgentState run(Long mediaId, VideoContext context, ModeProfile profile) {
         validateContext(context);
-        try (AgentExecutionBudget.Scope ignored = AgentExecutionBudget.open(maxDurationMs)) {
-            return runWithinBudget(mediaId, context, profile);
+        // 清除上一个任务残留的 ThreadLocal deadline，防止线程池复用时预算串号
+        AgentExecutionBudget.resetThreadLocal();
+        BudgetConfig budget = calculateDynamicBudget(context);
+        try (AgentExecutionBudget.Scope ignored = AgentExecutionBudget.open(budget.durationMs())) {
+            return runWithinBudget(mediaId, context, profile, budget);
         } catch (BudgetExceededException e) {
             throw e;
         } catch (RuntimeException e) {
@@ -86,69 +105,168 @@ public class AgentLoopService {
         }
     }
 
-    private AgentState runWithinBudget(Long mediaId, VideoContext context, ModeProfile profile) {
+    /**
+     * 根据视频复杂度动态调整预算。简单视频（< 5 分钟、< 10 段）只给 1 轮、60s；
+     * 中等视频（5–30 分钟）给 2 轮、120s；复杂长视频给满配置上限。
+     * 所有动态值都不超过 application.yml 中配置的上限。
+     *
+     * <p>注意：LLM 单次调用通常需要 20-40s，加上 VideoContext 构建和 Planner，
+     * 总耗时很容易超过 60s。预算必须留够余量。
+     */
+    private BudgetConfig calculateDynamicBudget(VideoContext context) {
+        long totalDurationMs = context.segments().stream()
+                .mapToLong(s -> s.endMs() - s.startMs())
+                .sum();
+        int segmentCount = context.segments().size();
+
+        int dynamicRounds;
+        long dynamicDurationMs;
+        long dynamicTokens;
+
+        if (totalDurationMs < 300_000L && segmentCount < 10) {
+            // Simple: short video with few segments — 1 round, 60s
+            dynamicRounds = 1;
+            dynamicDurationMs = 60_000L;
+            dynamicTokens = 30_000L;
+        } else if (totalDurationMs < 1_800_000L) {
+            // Medium: up to 30 minutes — 2 rounds, use 80% of max budget
+            dynamicRounds = 2;
+            dynamicDurationMs = (long) (maxDurationMs * 0.8);
+            dynamicTokens = (long) (maxEstimatedTokens * 0.8);
+        } else {
+            // Complex: longer than 30 minutes — use full config budget
+            dynamicRounds = maxRounds;
+            dynamicDurationMs = maxDurationMs;
+            dynamicTokens = maxEstimatedTokens;
+        }
+
+        // Never exceed configured ceiling
+        return new BudgetConfig(
+                Math.min(dynamicRounds, maxRounds),
+                Math.min(dynamicDurationMs, maxDurationMs),
+                Math.min(dynamicTokens, maxEstimatedTokens));
+    }
+
+    private AgentState runWithinBudget(Long mediaId, VideoContext context, ModeProfile profile,
+                                       BudgetConfig budget) {
         long runStartedNanos = System.nanoTime();
         AgentState savedState = mediaId == null ? null
                 : checkpointService.loadCriticState(mediaId, context.userGoal(), modeOf(profile));
-        boolean terminalCheckpoint = savedState != null && savedState.result() != null
-                && savedState.critique() != null
-                && (savedState.round() >= maxRounds || savedState.critique().passed());
-        if (terminalCheckpoint
-                && isPlanValid(savedState.plan())
-                && isResultValid(savedState.result(), profile)) {
-            checkpointService.saveResult(mediaId, savedState, modeOf(profile));
-            telemetry.incrementCurrent("terminalCheckpointHits", 1);
-            return savedState;
-        }
-        if (terminalCheckpoint) {
-            telemetry.incrementCurrent("invalidTerminalCheckpointRepairs", 1);
-            savedState = new AgentState(
-                    savedState.goal(), savedState.plan(), savedState.result(), savedState.critique(), 0);
-        }
 
         VideoContext relevantContext = longVideoContextService.selectRelevant(mediaId, context);
         AgentState.AgentPlan plan = resolvePlan(mediaId, relevantContext, savedState, profile);
-        checkBudget(runStartedNanos, "Planner");
+        checkBudget(runStartedNanos, "Planner", budget);
         if (mediaId != null) {
             taskEventService.publishAnalysis(mediaId, relevantContext.userGoal(), modeOf(profile),
                     TaskStatus.of(TaskStatus.State.PROCESSING, "Planner 已完成任务拆解"),
                     TaskStage.PLAN_COMPLETED);
         }
-        AgentState state = savedState == null
-                ? new AgentState(relevantContext.userGoal(), plan, null, null, 0)
-                : savedState;
-        if (state.critique() != null && !state.critique().passed()) {
+
+        // Determine resume strategy from saved state
+        AgentState state;
+        ResumeDecision resumeDecision;
+        if (savedState == null) {
+            state = new AgentState(relevantContext.userGoal(), plan, null, null, 0);
+            resumeDecision = ResumeDecision.CONTINUE_FROM_ROUNDS;
+        } else {
+            resumeDecision = resolveResumeDecision(savedState, profile, budget);
+            state = switch (resumeDecision) {
+                case RETURN_IMMEDIATELY -> {
+                    checkpointService.saveResult(mediaId, savedState, modeOf(profile));
+                    telemetry.incrementCurrent("terminalCheckpointHits", 1);
+                    yield savedState;
+                }
+                case REPAIR_AND_CONTINUE -> new AgentState(
+                        savedState.goal(), savedState.plan(), savedState.result(), savedState.critique(), 0);
+                case CRITIC_CHECKPOINT -> {
+                    telemetry.incrementCurrent("criticCheckpointResumes", 1);
+                    checkBudget(runStartedNanos, "Executor Checkpoint", budget);
+                    yield new AgentState(savedState.goal(), plan,
+                            savedState.result(), savedState.critique(), savedState.round());
+                }
+                case CONTINUE_FROM_ROUNDS -> new AgentState(
+                        savedState.goal(), plan, savedState.result(), savedState.critique(), savedState.round());
+            };
+            if (resumeDecision == ResumeDecision.RETURN_IMMEDIATELY) {
+                return state;
+            }
+        }
+
+        // Pre-loop: if resuming with failed critique, refresh evidence and revise plan
+        if (resumeDecision == ResumeDecision.CONTINUE_FROM_ROUNDS
+                || resumeDecision == ResumeDecision.REPAIR_AND_CONTINUE) {
+            if (state.critique() != null && !state.critique().passed()) {
+                relevantContext = contextForRetry(
+                        mediaId, context, relevantContext, state.critique(), profile);
+                plan = revisePlanForRetry(mediaId, relevantContext, plan, state.critique(), profile);
+            }
+        }
+
+        // Critic checkpoint resume: skip executor, go directly to critique
+        if (resumeDecision == ResumeDecision.CRITIC_CHECKPOINT) {
+            state = critiqueRound(mediaId, relevantContext, plan, state.result(), state.round(), profile, budget);
+            if (state.critique().passed() || state.round() >= budget.maxRounds()) {
+                return finalizeState(mediaId, state, profile);
+            }
             relevantContext = contextForRetry(
                     mediaId, context, relevantContext, state.critique(), profile);
             plan = revisePlanForRetry(mediaId, relevantContext, plan, state.critique(), profile);
         }
 
-        // Executor 草稿已经落盘时，MQ 重试直接从 Critic 接着走，避免重复生成整份产物。
-        if (state.result() != null && state.critique() == null && state.round() > 0) {
-            telemetry.incrementCurrent("criticCheckpointResumes", 1);
-            checkBudget(runStartedNanos, "Executor Checkpoint");
-            state = critiqueRound(mediaId, relevantContext, plan, state.result(), state.round(), profile);
-            if (!state.critique().passed() && state.round() < maxRounds) {
+        // Main execute-critique-retry loop
+        for (int round = state.round() + 1; round <= budget.maxRounds(); round++) {
+            checkBudget(runStartedNanos, "Agent Round " + round, budget);
+            state = executeRound(
+                    mediaId, relevantContext, plan, state.critique(), round, runStartedNanos, profile, budget);
+            if (state.critique().passed()) break;
+            if (round < budget.maxRounds()) {
                 relevantContext = contextForRetry(
                         mediaId, context, relevantContext, state.critique(), profile);
                 plan = revisePlanForRetry(mediaId, relevantContext, plan, state.critique(), profile);
             }
         }
 
-        for (int round = state.round() + 1; round <= maxRounds; round++) {
-            checkBudget(runStartedNanos, "Agent Round " + round);
-            state = executeRound(
-                    mediaId, relevantContext, plan, state.critique(), round, runStartedNanos, profile);
-            if (state.critique().passed()) break;
-            if (round < maxRounds) {
-                relevantContext = contextForRetry(
-                        mediaId, context, relevantContext, state.critique(), profile);
-                plan = revisePlanForRetry(mediaId, relevantContext, plan, state.critique(), profile);
+        return finalizeState(mediaId, state, profile);
+    }
+
+    /** Classify the saved checkpoint into one of four resume strategies. */
+    private ResumeDecision resolveResumeDecision(AgentState savedState, ModeProfile profile,
+                                                 BudgetConfig budget) {
+        boolean terminal = savedState.result() != null
+                && savedState.critique() != null
+                && (savedState.round() >= budget.maxRounds() || savedState.critique().passed());
+
+        if (terminal) {
+            if (isPlanValid(savedState.plan()) && isResultValid(savedState.result(), profile)) {
+                return ResumeDecision.RETURN_IMMEDIATELY;
             }
+            telemetry.incrementCurrent("invalidTerminalCheckpointRepairs", 1);
+            return ResumeDecision.REPAIR_AND_CONTINUE;
         }
+
+        // Executor draft was persisted but Critic hasn't run yet → skip executor, resume from Critic
+        if (savedState.result() != null && savedState.critique() == null && savedState.round() > 0) {
+            return ResumeDecision.CRITIC_CHECKPOINT;
+        }
+
+        return ResumeDecision.CONTINUE_FROM_ROUNDS;
+    }
+
+    private AgentState finalizeState(Long mediaId, AgentState state, ModeProfile profile) {
         validateResult(state.result(), profile);
         if (mediaId != null) checkpointService.saveResult(mediaId, state, modeOf(profile));
         return state;
+    }
+
+    private enum ResumeDecision {
+        /** Terminal checkpoint is valid — return immediately without re-execution. */
+        RETURN_IMMEDIATELY,
+        /** Terminal checkpoint has invalid structure — reset round to 0 and re-execute. */
+        REPAIR_AND_CONTINUE,
+        /** Executor draft persisted, Critic not yet run — skip to Critic phase. */
+        CRITIC_CHECKPOINT,
+        /** Normal resume: continue from saved round with refreshed evidence. */
+        CONTINUE_FROM_ROUNDS
     }
 
     private AgentState.AgentPlan resolvePlan(Long mediaId,
@@ -182,7 +300,8 @@ public class AgentLoopService {
                                     AgentState.CriticResult previousCritique,
                                     int round,
                                     long runStartedNanos,
-                                    ModeProfile profile) {
+                                    ModeProfile profile,
+                                    BudgetConfig budget) {
         publishStage(mediaId, context.userGoal(), modeOf(profile),
                 "Executor 正在按计划生成结构化产物", TaskStage.EXECUTOR_STARTED);
         AnalysisResult result = deepSeekUtils.execute(context, plan, previousCritique, executeInstruction(profile));
@@ -192,8 +311,8 @@ public class AgentLoopService {
             publishStage(mediaId, context.userGoal(), modeOf(profile),
                     "Executor 草稿已保存，开始校验证据", TaskStage.EXECUTOR_COMPLETED);
         }
-        checkBudget(runStartedNanos, "Executor");
-        return critiqueRound(mediaId, context, plan, result, round, profile);
+        checkBudget(runStartedNanos, "Executor", budget);
+        return critiqueRound(mediaId, context, plan, result, round, profile, budget);
     }
 
     private AgentState critiqueRound(Long mediaId,
@@ -201,7 +320,8 @@ public class AgentLoopService {
                                      AgentState.AgentPlan plan,
                                      AnalysisResult result,
                                      int round,
-                                     ModeProfile profile) {
+                                     ModeProfile profile,
+                                     BudgetConfig budget) {
         publishStage(mediaId, context.userGoal(), modeOf(profile),
                 "Critic 正在核验目标覆盖与时间戳证据", TaskStage.CRITIC_STARTED);
         AgentState.CriticResult critique = normalizeCritique(
@@ -219,7 +339,7 @@ public class AgentLoopService {
             if (critique.passed()) {
                 message = "Critic 校验通过，正在整理结构化结果";
                 stage = TaskStage.CRITIC_PASSED;
-            } else if (round >= maxRounds) {
+            } else if (round >= budget.maxRounds()) {
                 message = "Critic 达到最大校验轮次，正在保留警告并生成结果";
                 stage = TaskStage.ANALYSIS_COMPLETED_WITH_WARNINGS;
             } else if (requiresEvidenceRefresh(critique)) {
@@ -442,15 +562,15 @@ public class AgentLoopService {
                 .toList();
     }
 
-    private void checkBudget(long startedNanos, String completedStage) {
+    private void checkBudget(long startedNanos, String completedStage, BudgetConfig budget) {
         AgentExecutionBudget.check(completedStage);
         long elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000;
         AgentTelemetry.BudgetUsage usage = telemetry.currentUsage();
         String reason = null;
-        if (elapsedMs > maxDurationMs) {
-            reason = "Agent 超过最大执行时长 " + maxDurationMs + "ms";
-        } else if (usage.estimatedTokens() > maxEstimatedTokens) {
-            reason = "Agent 超过最大 Token 预算 " + maxEstimatedTokens;
+        if (elapsedMs > budget.durationMs()) {
+            reason = "Agent 超过最大执行时长 " + budget.durationMs() + "ms";
+        } else if (usage.estimatedTokens() > budget.maxTokens()) {
+            reason = "Agent 超过最大 Token 预算 " + budget.maxTokens();
         } else if (maxEstimatedCost > 0 && usage.estimatedCost() > maxEstimatedCost) {
             reason = "Agent 超过最大成本预算 " + maxEstimatedCost;
         }

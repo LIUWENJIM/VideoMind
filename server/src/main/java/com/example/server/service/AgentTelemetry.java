@@ -33,10 +33,14 @@ public class AgentTelemetry {
     private final ThreadLocal<String> currentTrace = new ThreadLocal<>();
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
+    private final TokenCounter tokenCounter;
 
-    public AgentTelemetry(StringRedisTemplate redisTemplate, ObjectMapper objectMapper) {
+    public AgentTelemetry(StringRedisTemplate redisTemplate,
+                          ObjectMapper objectMapper,
+                          TokenCounter tokenCounter) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
+        this.tokenCounter = tokenCounter;
     }
 
     public String start(Long taskId, String goal) {
@@ -120,8 +124,8 @@ public class AgentTelemetry {
         TraceData trace = traceId == null ? null : traces.get(traceId);
         if (trace == null) return;
 
-        long inputTokens = estimateTokens(prompt);
-        long outputTokens = estimateTokens(response);
+        long inputTokens = tokenCounter.count(prompt);
+        long outputTokens = tokenCounter.count(response);
         trace.increment("modelCalls", 1);
         trace.increment("inputTokensEstimated", inputTokens);
         trace.increment("outputTokensEstimated", outputTokens);
@@ -222,13 +226,6 @@ public class AgentTelemetry {
 
     private String taskKey(Long taskId, String goalDigest) {
         return taskId + ":" + goalDigest;
-    }
-
-    private long estimateTokens(String text) {
-        if (text == null || text.isEmpty()) return 0;
-        long nonAscii = text.codePoints().filter(codePoint -> codePoint > 127).count();
-        long ascii = text.codePoints().count() - nonAscii;
-        return Math.max(1, nonAscii + (ascii + 3) / 4);
     }
 
     private static class TraceData {

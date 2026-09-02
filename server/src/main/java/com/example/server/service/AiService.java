@@ -3,6 +3,8 @@ package com.example.server.service;
 import com.example.server.dto.AgentFeedback;
 import com.example.server.dto.AgentState;
 import com.example.server.dto.AnalysisMode;
+import com.example.server.dto.AnalysisResult;
+import com.example.server.dto.DeepAnalysisResult;
 import com.example.server.dto.TaskStatus;
 import com.example.server.dto.TaskStage;
 import com.example.server.dto.VideoContext;
@@ -11,6 +13,7 @@ import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.service.mode.ModeRegistry;
 import com.example.server.utils.AnalysisTaskKeys;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
@@ -39,6 +42,7 @@ public class AiService {
     private final VideoContextService videoContextService;
     private final LongVideoContextService longVideoContextService;
     private final AgentLoopService agentLoopService;
+    private final DeepAgentLoopService deepAgentLoopService;
     private final AgentCheckpointService checkpointService;
     private final AgentTelemetry telemetry;
     private final MediaService mediaService;
@@ -46,22 +50,26 @@ public class AiService {
     private final RedissonClient redissonClient;
     private final StringRedisTemplate redisTemplate;
     private final ModeRegistry modeRegistry;
+    private final ObjectMapper objectMapper;
 
     public AiService(MediaFileMapper mediaFileMapper,
                      VideoContextService videoContextService,
                      LongVideoContextService longVideoContextService,
                      AgentLoopService agentLoopService,
+                     DeepAgentLoopService deepAgentLoopService,
                      AgentCheckpointService checkpointService,
                      AgentTelemetry telemetry,
                      MediaService mediaService,
                      TaskEventService taskEventService,
                      RedissonClient redissonClient,
                      StringRedisTemplate redisTemplate,
-                     ModeRegistry modeRegistry) {
+                     ModeRegistry modeRegistry,
+                     ObjectMapper objectMapper) {
         this.mediaFileMapper = mediaFileMapper;
         this.videoContextService = videoContextService;
         this.longVideoContextService = longVideoContextService;
         this.agentLoopService = agentLoopService;
+        this.deepAgentLoopService = deepAgentLoopService;
         this.checkpointService = checkpointService;
         this.telemetry = telemetry;
         this.mediaService = mediaService;
@@ -69,6 +77,7 @@ public class AiService {
         this.redissonClient = redissonClient;
         this.redisTemplate = redisTemplate;
         this.modeRegistry = modeRegistry;
+        this.objectMapper = objectMapper;
     }
 
     /** 兼容旧调用方:未指定模式时按 GENERAL 分析。 */
@@ -106,15 +115,28 @@ public class AiService {
                     TaskStage.AGENT_LOOP);
             long agentStarted = System.nanoTime();
             try {
-                agentState = agentLoopService.run(mediaId, videoContext, modeRegistry.of(resolvedMode));
-                telemetry.stage(traceId, TaskStage.AGENT_LOOP.name(), agentStarted, true);
+                // 根据模式选择不同的分析服务
+                if (resolvedMode == AnalysisMode.DEEP) {
+                    // 深度分析模式：使用 DeepAgentLoopService
+                    DeepAnalysisResult deepResult = deepAgentLoopService.analyze(
+                            mediaId, videoContext, userGoal, modeRegistry.of(resolvedMode));
+                    telemetry.stage(traceId, TaskStage.AGENT_LOOP.name(), agentStarted, true);
+                    // 将深度分析结果转换为 Markdown 并保存
+                    persistDeepResult(mediaFile, deepResult, userGoal, resolvedMode);
+                    log.info("deep_analysis_completed traceId={} mediaId={} insights={}",
+                            traceId, mediaId, deepResult.keyInsights().size());
+                } else {
+                    // 普通分析模式：使用原有的 AgentLoopService
+                    AgentState analysisResult = agentLoopService.run(mediaId, videoContext, modeRegistry.of(resolvedMode));
+                    telemetry.stage(traceId, TaskStage.AGENT_LOOP.name(), agentStarted, true);
+                    persistResult(mediaFile, analysisResult);
+                    log.info("agent_analysis_completed traceId={} mediaId={} rounds={}",
+                            traceId, mediaId, analysisResult.round());
+                }
             } catch (RuntimeException e) {
                 telemetry.stage(traceId, TaskStage.AGENT_LOOP.name(), agentStarted, false);
                 throw e;
             }
-            persistResult(mediaFile, agentState);
-            log.info("agent_analysis_completed traceId={} mediaId={} rounds={}",
-                    traceId, mediaId, agentState.round());
         } catch (Exception e) {
             try {
                 checkpointService.saveFailure(mediaId, userGoal, resolvedMode, currentStage, e);
@@ -145,49 +167,74 @@ public class AiService {
                                         String userGoal,
                                         String traceId,
                                         AnalysisMode mode) {
-        VideoContext checkpoint = checkpointService.loadContext(mediaFile.getId());
-        if (checkpoint != null) {
-            telemetry.increment(traceId, "contextCheckpointHits", 1);
-            return new VideoContext(checkpoint.source(), userGoal, checkpoint.segments());
-        }
+        // Phase 1: Checkpoint or content-reuse (fast path, no lock needed)
+        VideoContext fastPath = checkpointOrReuseFirst(mediaFile, userGoal, traceId);
+        if (fastPath != null) return fastPath;
 
+        // Phase 2: Acquire content lock and build with double-check
         String contentHash = AnalysisTaskKeys.normalizeContentHash(
                 mediaFile.getId(), mediaService.contentHash(mediaFile.getId()));
-        VideoContext reused = reuseContentContext(mediaFile, userGoal, traceId, contentHash);
-        if (reused != null) return reused;
-
-        // 同一视频被多个目标同时提交时，只让一个消费者真正跑 ASR/OCR，其余等待后复用。
         RLock contextLock = redissonClient.getLock(AnalysisTaskKeys.contextLock(contentHash));
         boolean locked = false;
         try {
             locked = contextLock.tryLock(CONTEXT_LOCK_WAIT_SECONDS, TimeUnit.SECONDS);
-            // 无论是否抢到锁都要重查，且必须先查自身检查点：同一个 mediaId 换目标并发提交时，
-            // 先完成者登记的归属正是这个 mediaId，只查归属索引会被 "owner == 自己" 判空而漏掉，
-            // 于是又重跑一遍完整 ASR/OCR。
-            VideoContext own = checkpointService.loadContext(mediaFile.getId());
-            if (own != null) {
-                telemetry.increment(traceId, "contextCheckpointHits", 1);
-                return new VideoContext(own.source(), userGoal, own.segments());
-            }
-            VideoContext afterWait = reuseContentContext(mediaFile, userGoal, traceId, contentHash);
-            if (afterWait != null) return afterWait;
-
-            if (!locked) {
-                // 没抢到锁说明同一视频的上下文仍在被另一个消费者构建。此处绝不能自己再跑一遍——
-                // 那正是要消除的重复 ASR/OCR。本地等待只负责消化短时争用，超出等待窗口就交给
-                // RocketMQ 做跨时间重投：等对方落盘后，重投的这条消息会在上面两次复用检查中直接命中。
-                telemetry.increment(traceId, "contextLockContentions", 1);
-                log.warn("context_build_in_progress mediaId={} contentHash={} waitedSeconds={}",
-                        mediaFile.getId(), contentHash, CONTEXT_LOCK_WAIT_SECONDS);
-                throw new IllegalStateException("同一视频的上下文正在构建中，稍后重试");
-            }
-            return buildContext(mediaFile, userGoal, traceId, contentHash, mode);
+            return buildAfterLock(mediaFile, userGoal, traceId, contentHash, mode, locked);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("等待视频上下文构建锁被中断", e);
         } finally {
             if (locked && contextLock.isHeldByCurrentThread()) contextLock.unlock();
         }
+    }
+
+    /** Fast path: check own checkpoint first, then try content-level reuse. */
+    private VideoContext checkpointOrReuseFirst(MediaFile mediaFile, String userGoal, String traceId) {
+        VideoContext checkpoint = checkpointService.loadContext(mediaFile.getId());
+        if (checkpoint != null) {
+            telemetry.increment(traceId, "contextCheckpointHits", 1);
+            return withGoal(checkpoint, userGoal);
+        }
+        String contentHash = AnalysisTaskKeys.normalizeContentHash(
+                mediaFile.getId(), mediaService.contentHash(mediaFile.getId()));
+        VideoContext reused = reuseContentContext(mediaFile, userGoal, traceId, contentHash);
+        if (reused != null) return reused;
+        return null;
+    }
+
+    /**
+     * After acquiring (or failing to acquire) the content lock, double-check that no other
+     * consumer has completed the build while we were waiting, then build if we hold the lock.
+     */
+    private VideoContext buildAfterLock(MediaFile mediaFile,
+                                        String userGoal,
+                                        String traceId,
+                                        String contentHash,
+                                        AnalysisMode mode,
+                                        boolean locked) {
+        // Double-check: another consumer may have finished while we waited for the lock.
+        VideoContext own = checkpointService.loadContext(mediaFile.getId());
+        if (own != null) {
+            telemetry.increment(traceId, "contextCheckpointHits", 1);
+            return withGoal(own, userGoal);
+        }
+        VideoContext afterWait = reuseContentContext(mediaFile, userGoal, traceId, contentHash);
+        if (afterWait != null) return afterWait;
+
+        if (!locked) {
+            // 没抢到锁说明同一视频的上下文仍在被另一个消费者构建。此处绝不能自己再跑一遍——
+            // 那正是要消除的重复 ASR/OCR。本地等待只负责消化短时争用，超出等待窗口就交给
+            // RocketMQ 做跨时间重投：等对方落盘后，重投的这条消息会在上面两次复用检查中直接命中。
+            telemetry.increment(traceId, "contextLockContentions", 1);
+            log.warn("context_build_in_progress mediaId={} contentHash={} waitedSeconds={}",
+                    mediaFile.getId(), contentHash, CONTEXT_LOCK_WAIT_SECONDS);
+            throw new IllegalStateException("同一视频的上下文正在构建中，稍后重试");
+        }
+        return buildContext(mediaFile, userGoal, traceId, contentHash, mode);
+    }
+
+    /** Replace the userGoal on a VideoContext while keeping source and segments intact. */
+    private VideoContext withGoal(VideoContext ctx, String userGoal) {
+        return new VideoContext(ctx.source(), userGoal, ctx.segments());
     }
 
     /** 命中内容级上下文时，把它挂到当前 mediaId 上并改写素材地址，跳过整段 ASR/OCR。 */
@@ -210,7 +257,7 @@ public class AiService {
         telemetry.increment(traceId, "contextContentReuses", 1);
         log.info("video_context_reused mediaId={} sourceMediaId={} contentHash={}",
                 mediaFile.getId(), ownerMediaId, contentHash);
-        return new VideoContext(localized.source(), userGoal, localized.segments());
+        return withGoal(localized, userGoal);
     }
 
     private VideoContext buildContext(MediaFile mediaFile,
@@ -398,5 +445,49 @@ public class AiService {
         mediaFile.setAiSummary(agentState.result().toMarkdown());
         mediaFileMapper.updateById(mediaFile);
         mediaService.invalidateUserList(mediaFile.getUserId());
+    }
+
+    /**
+     * 保存深度分析结果：将 DeepAnalysisResult 转换为 Markdown 格式并保存到数据库。
+     * 同时保存结构化的 JSON 数据，以便前端展示洞察卡片等组件。
+     */
+    private void persistDeepResult(MediaFile mediaFile, DeepAnalysisResult deepResult,
+                                    String userGoal, AnalysisMode mode) {
+        if (deepResult == null) throw new IllegalStateException("深度分析未生成结果");
+
+        // 保存 Markdown 格式（向后兼容）
+        mediaFile.setAiSummary(deepResult.toMarkdown());
+
+        // 保存结构化的 JSON 数据（新增）
+        try {
+            mediaFile.setDeepAnalysisJson(objectMapper.writeValueAsString(deepResult));
+        } catch (Exception e) {
+            log.warn("Failed to serialize DeepAnalysisResult to JSON", e);
+        }
+
+        mediaFileMapper.updateById(mediaFile);
+        mediaService.invalidateUserList(mediaFile.getUserId());
+
+        // 保存检查点（复用现有的检查点机制）
+        // 将 DeepAnalysisResult 包装成 AgentState 以便复用检查点逻辑
+        AgentState.AgentPlan plan = new AgentState.AgentPlan(userGoal, List.of("深度分析"));
+        AnalysisResult simpleResult = new AnalysisResult(
+                deepResult.executiveSummary(),
+                deepResult.keyInsights().stream()
+                        .map(DeepAnalysisResult.KeyInsight::insight)
+                        .toList(),
+                deepResult.supportingEvidence().stream()
+                        .map(e -> new AnalysisResult.Evidence(
+                                e.timestampMs(), e.source(), e.content(), e.claim()))
+                        .toList(),
+                deepResult.actionableTakeaways().stream()
+                        .map(DeepAnalysisResult.ActionableTakeaway::takeaway)
+                        .toList(),
+                deepResult.sections().stream()
+                        .map(s -> new AnalysisResult.Section(s.key(), s.title(), s.items()))
+                        .toList()
+        );
+        AgentState state = new AgentState(userGoal, plan, simpleResult, null, 1);
+        checkpointService.saveResult(mediaFile.getId(), state, mode);
     }
 }

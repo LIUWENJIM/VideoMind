@@ -73,7 +73,7 @@ public class VideoEvidenceRetrievalService {
         }
         return rankedChunks.stream()
                 .flatMap(chunk -> chunk.chunk().rawSegments().stream()
-                        .map(segment -> scoreSegment(intent, chunk.score(), segment)))
+                        .map(segment -> scoreSegment(intent, chunk.score(), segment, weightsFor(intent))))
                 .sorted(Comparator.comparingDouble(ScoredSegment::score).reversed()
                         .thenComparingLong(result -> result.segment().startMs()))
                 .toList();
@@ -97,10 +97,38 @@ public class VideoEvidenceRetrievalService {
         double semanticScore = remoteScore == null
                 ? cosine(queryEmbedding, chunk.embedding())
                 : remoteScore;
-        return semanticScore * 0.6
-                + termScore(intent.keywords(), searchableText(chunk)) * 0.25
-                + termScore(intent.visualKeywords(), visualText(chunk)) * 0.15;
+        Weights w = weightsFor(intent);
+        return semanticScore * w.semantic
+                + termScore(intent.keywords(), searchableText(chunk)) * w.keyword
+                + termScore(intent.visualKeywords(), visualText(chunk)) * w.visual;
     }
+
+    /**
+     * 根据检索意图的信号动态调整权重：
+     * <ul>
+     *   <li>有视觉关键词 → DEMO/课件类：提升视觉权重到 0.30</li>
+     *   <li>关键词 ≥ 5 个但无视觉词 → LECTURE 类：提升关键词权重到 0.35</li>
+     *   <li>其他 → GENERAL：默认 0.6/0.25/0.15</li>
+     * </ul>
+     */
+    private Weights weightsFor(VideoRetrievalIntent intent) {
+        boolean hasVisual = !intent.visualKeywords().isEmpty();
+        boolean manyKeywords = intent.keywords().size() >= 5;
+
+        if (hasVisual) {
+            // Demo / visual-heavy content: boost visual weight
+            return new Weights(0.50, 0.20, 0.30);
+        } else if (manyKeywords) {
+            // Lecture / term-heavy content: boost keyword weight
+            return new Weights(0.50, 0.35, 0.15);
+        } else {
+            // Default balanced weights
+            return new Weights(0.60, 0.25, 0.15);
+        }
+    }
+
+    /** Adaptive weights for chunk-level scoring. */
+    private record Weights(double semantic, double keyword, double visual) {}
 
     private Map<String, Double> vectorScores(Long mediaId, List<Double> queryEmbedding) {
         Map<String, Double> scores = new LinkedHashMap<>();
@@ -116,13 +144,19 @@ public class VideoEvidenceRetrievalService {
 
     private ScoredSegment scoreSegment(VideoRetrievalIntent intent,
                                        double chunkScore,
-                                       VideoContext.VideoSegment segment) {
+                                       VideoContext.VideoSegment segment,
+                                       Weights w) {
         double transcriptScore = termScore(intent.keywords(), segment.transcript());
         double visualScore = termScore(
                 intent.visualKeywords(), String.join(" ", normalizedOcrTexts(segment)));
+        // Segment-level weights adapt to chunk-level: visual content boosts visual score,
+        // otherwise transcript (keyword) gets more emphasis.
+        double chunkWeight = 0.55;
+        double transcriptWeight = w.visual > 0.20 ? 0.15 : 0.25;
+        double visualWeight = w.visual > 0.20 ? 0.30 : 0.20;
         return new ScoredSegment(
                 segment,
-                chunkScore * 0.55 + transcriptScore * 0.25 + visualScore * 0.20,
+                chunkScore * chunkWeight + transcriptScore * transcriptWeight + visualScore * visualWeight,
                 transcriptScore,
                 visualScore);
     }

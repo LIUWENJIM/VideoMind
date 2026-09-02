@@ -84,6 +84,16 @@ public class MediaService {
         }
     }
 
+    /**
+     * 更新媒体文件的封面 URL。
+     */
+    public void updateCoverUrl(Long mediaId, String coverUrl) {
+        MediaFile update = new MediaFile();
+        update.setId(mediaId);
+        update.setCoverUrl(coverUrl);
+        mediaFileMapper.updateById(update);
+    }
+
     public MediaFile saveUploadedMedia(String filename, String fileUrl, Long userId, String md5) {
         MediaFile mediaFile = new MediaFile();
         mediaFile.setFilename(normalizeVideoFilename(filename));

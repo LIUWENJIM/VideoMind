@@ -14,6 +14,17 @@ public final class AgentExecutionBudget {
     private AgentExecutionBudget() {
     }
 
+    /**
+     * 清除当前线程上残留的 deadline。
+     *
+     * <p>RocketMQ 消费者线程池会复用线程，如果上一个任务的 deadline 没有被正确清理，
+     * 下一个任务会继承旧的 deadline，导致预算提前耗尽。在每次 Agent run() 入口调用此方法
+     * 可以确保每次执行都有干净的预算状态。
+     */
+    public static void resetThreadLocal() {
+        DEADLINE_NANOS.remove();
+    }
+
     public static Scope open(long maxDurationMs) {
         if (maxDurationMs < 1) throw new IllegalArgumentException("Agent 执行时长预算必须大于 0");
         Long previous = DEADLINE_NANOS.get();

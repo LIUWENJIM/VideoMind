@@ -21,6 +21,7 @@ public class MediaFile {
     private String contentHash;
 
     private String aiSummary;
+    private String deepAnalysisJson;  // 存储 DeepAnalysisResult 的 JSON 格式
     private String transcriptText;
     private String coverUrl;
 

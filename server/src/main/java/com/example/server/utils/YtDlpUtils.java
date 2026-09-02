@@ -29,6 +29,46 @@ public class YtDlpUtils {
         this.ffmpegDir = ffmpegDir;
     }
 
+    /**
+     * 使用 yt-dlp 提取视频标题（不下载视频本身）。
+     * 失败时返回 null，调用方降级到默认文件名。
+     */
+    public String extractTitle(String url) {
+        try {
+            validatePublicHttpUrl(url);
+            List<String> command = List.of(
+                    ytDlpPath,
+                    "--no-playlist",
+                    "--print", "title",
+                    "--no-download",
+                    "--socket-timeout", "15",
+                    url
+            );
+            Process process = new ProcessBuilder(command)
+                    .redirectErrorStream(false)
+                    .start();
+            String title;
+            try (var reader = process.inputReader()) {
+                title = reader.readLine();
+            }
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return null;
+            }
+            if (process.exitValue() != 0 || title == null || title.isBlank()) {
+                return null;
+            }
+            // 清理标题中不合法的文件名字符
+            return title.trim()
+                    .replaceAll("[\\\\/:*?\"<>|]", "")
+                    .replaceAll("\\s+", " ")
+                    .strip();
+        } catch (Exception e) {
+            log.warn("yt_dlp_title_extraction失败 url={}", url, e);
+            return null;
+        }
+    }
+
     public File downloadVideo(String url) throws Exception {
         validatePublicHttpUrl(url);
         Path outputPath = Path.of(System.getProperty("java.io.tmpdir"), UUID.randomUUID() + ".mp4");
@@ -51,6 +91,10 @@ public class YtDlpUtils {
         command.add("mp4");
         command.add("--recode-video");
         command.add("mp4");
+        // 同时下载封面缩略图
+        command.add("--write-thumbnail");
+        command.add("--convert-thumbnails");
+        command.add("jpg");
         if (ffmpegDir != null && !ffmpegDir.isBlank()) {
             command.add("--ffmpeg-location");
             command.add(ffmpegDir);
@@ -82,6 +126,95 @@ public class YtDlpUtils {
             Files.deleteIfExists(logPath);
             if (process != null && process.isAlive()) process.destroyForcibly();
         }
+    }
+
+    /**
+     * 查找 yt-dlp 下载到本地的封面缩略图文件。
+     * yt-dlp 会把缩略图保存到与视频同目录、同名但扩展名为 .jpg/.webp/.png 的文件。
+     */
+    public File findDownloadedThumbnail(File videoFile) {
+        if (videoFile == null) return null;
+        Path parent = videoFile.toPath().getParent();
+        String baseName = videoFile.getName();
+        int dot = baseName.lastIndexOf('.');
+        if (dot > 0) baseName = baseName.substring(0, dot);
+        for (String ext : List.of(".jpg", ".webp", ".png")) {
+            Path candidate = parent.resolve(baseName + ext);
+            if (Files.isRegularFile(candidate)) return candidate.toFile();
+        }
+        return null;
+    }
+
+    /**
+     * 用 FFmpeg 从视频文件提取一帧作为封面。
+     * 取视频 10% 处的帧，避免片头黑屏/标题卡。失败返回 null。
+     */
+    public File extractCoverFromVideo(File videoFile) {
+        if (videoFile == null || !videoFile.exists()) return null;
+        try {
+            // 先获取视频时长
+            Path durationLog = Files.createTempFile("ffmpeg-duration-", ".log");
+            List<String> probeCmd = List.of(
+                    resolveFfmpeg(), "-i", videoFile.getAbsolutePath(),
+                    "-f", "null", "-"
+            );
+            Process probe = new ProcessBuilder(probeCmd)
+                    .redirectErrorStream(true)
+                    .redirectOutput(durationLog.toFile())
+                    .start();
+            String probeOutput = "";
+            if (probe.waitFor(30, TimeUnit.SECONDS)) {
+                probeOutput = Files.readString(durationLog);
+            } else {
+                probe.destroyForcibly();
+            }
+            Files.deleteIfExists(durationLog);
+
+            // 解析时长
+            double duration = 10.0; // 默认取第 10 秒
+            var matcher = java.util.regex.Pattern.compile("Duration:\\s*(\\d+):(\\d+):(\\d+\\.\\d+)").matcher(probeOutput);
+            if (matcher.find()) {
+                int h = Integer.parseInt(matcher.group(1));
+                int m = Integer.parseInt(matcher.group(2));
+                double s = Double.parseDouble(matcher.group(3));
+                duration = Math.max(1.0, (h * 3600 + m * 60 + s) * 0.1);
+            }
+
+            // 提取封面帧
+            Path coverPath = Files.createTempFile("cover-", ".jpg");
+            List<String> cmd = List.of(
+                    resolveFfmpeg(), "-y",
+                    "-ss", String.format("%.1f", duration),
+                    "-i", videoFile.getAbsolutePath(),
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    coverPath.toString()
+            );
+            Process process = new ProcessBuilder(cmd)
+                    .redirectErrorStream(true)
+                    .redirectOutput(Path.of(System.getProperty("java.io.tmpdir"), "ffmpeg-cover.log").toFile())
+                    .start();
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                Files.deleteIfExists(coverPath);
+                return null;
+            }
+            if (process.exitValue() != 0 || !Files.isRegularFile(coverPath) || Files.size(coverPath) < 100) {
+                Files.deleteIfExists(coverPath);
+                return null;
+            }
+            return coverPath.toFile();
+        } catch (Exception e) {
+            log.warn("ffmpeg_cover_extraction_failed", e);
+            return null;
+        }
+    }
+
+    private String resolveFfmpeg() {
+        if (ffmpegDir != null && !ffmpegDir.isBlank()) {
+            return Path.of(ffmpegDir, "ffmpeg").toString();
+        }
+        return "ffmpeg";
     }
 
     private void validatePublicHttpUrl(String value) throws Exception {

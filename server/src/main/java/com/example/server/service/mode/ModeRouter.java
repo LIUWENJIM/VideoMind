@@ -106,6 +106,7 @@ public class ModeRouter {
             case REVIEW -> "目标偏向查错与观点核验,已选审查模式";
             case CREATION -> "目标偏向内容再创作,已选创作模式";
             case GENERAL -> "目标较为通用,已选通用模式";
+            case DEEP -> "目标需要深度分析,已选深度分析模式";
         };
     }
 }

@@ -54,6 +54,16 @@ public class ModeRegistry {
                 "检查每个爆点是否有真实时间戳支撑、文案是否贴合视频实际内容,不得虚构。",
                 List.of("highlights", "titles", "intro", "script")));
 
+        // 深度分析模式:由 DeepAgentLoopService 独立处理,这里的 Profile 仅用于通过启动自检。
+        // 实际的 Planner/Executor/Critic 指令在 DeepSeekUtils.executeDeepAnalysis() 中定义。
+        register(new ModeProfile(AnalysisMode.DEEP, "深度分析",
+                "识别核心论点、隐含假设、论证逻辑与证据强度,评估优缺点与局限性,"
+                        + "关联到更广泛的知识背景,提炼可操作的洞察与应用建议。",
+                "产出核心洞察(带推理过程)、批判性分析(优点/局限性/替代观点)、"
+                        + "可操作收获(如何应用/下一步做什么)。",
+                "检查洞察是否有深度(不只是复述)、推理是否成立、批判是否平衡、建议是否可操作。",
+                List.of()));
+
         // 启动自检:每个 AnalysisMode 都必须注册 Profile。否则该模式在写端(AgentLoop 用
         // of(mode).mode())会回退成 GENERAL 键,而读端(status/asyncAnalyze)仍用该模式键,
         // 造成"前端永远查不到结果、消费者反复重算"的致命键不对称。宁可启动即失败也不让它上线。
